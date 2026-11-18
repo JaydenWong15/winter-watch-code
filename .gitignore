@@ -1,0 +1,5 @@
+FLAGS-LOG.md
+CHANGES-LOG.md
+worker/.wrangler/
+node_modules/
+raw/
