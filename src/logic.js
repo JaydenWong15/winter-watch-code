@@ -84,5 +84,44 @@ function rankPriorities(routes) {
   rows.sort((a, b) => (b.moveUp - a.moveUp) || (b.mean - a.mean) || (b.elev - a.elev));
   return { rows, q3 };
 }
+// ---- Chat retrieval: pick the slices of the same data the page uses (forecast, roads, history, plan, ranking) that match the question. ----
+// The AI only sees these slices, and the page lists them under each answer so every number has a source.
+function buildContext(q, d) {
+  const text = String(q || '').toLowerCase(), blocks = [], sources = [];
+  const R = d.hist.routes, add = (label, src, body) => { blocks.push('## ' + label + '\n' + (typeof body === 'string' ? body : JSON.stringify(body))); if (!sources.includes(src)) sources.push(src); };
+  const FC = 'Open-Meteo forecast', HI = 'Open-Meteo archive (ERA5), 7 winters', OSM = 'OpenStreetMap roads', RULE = 'Winter Watch rules (code)', ASM = 'Assumed fleet and tiers';
+  // tonight summary
+  if (d.fetchedAt) {
+    const grit = R.filter(r => d.assess[r.ref]?.verdict === 'GRIT'), marg = R.filter(r => d.assess[r.ref]?.verdict === 'MARGINAL');
+    const cold = R.map(r => ({ ref: r.ref, minT: d.assess[r.ref]?.minT })).filter(x => x.minT != null).sort((a, b) => a.minT - b.minT);
+    add('Tonight (night of ' + d.night + ', 18:00-09:00 Irish time; forecast fetched ' + d.fetchedAt + ')', FC, { countyVerdict: d.county, routesToGrit: grit.map(r => r.ref), marginalRoutes: marg.map(r => r.ref), coldest5: cold.slice(0, 5), rules: 'GRIT = air temp <= ' + CFG.iceT + 'C on a wet surface, or snow; MARGINAL = <= ' + CFG.marginalT + 'C and wet, or dry frost' });
+  } else blocks.push('## Tonight\nThe live forecast has not been fetched yet.');
+  add('Route index (ref, name, class, current tier, carriageway-km, height m, average grit nights per winter over 7 winters)', OSM, R.map(r => [r.ref, r.name, r.cls, 'P' + TIER[r.cls], r.km, r.elev, +(r.winters.reduce((s, w) => s + w.grit, 0) / r.winters.length).toFixed(1)]));
+  // routes named in the question
+  const hit = new Set(); (text.match(/\b[mnr]\d{1,3}\b/g) || []).forEach(x => hit.add(x.toUpperCase()));
+  R.forEach(r => { if (r.name && r.name.length >= 5 && text.includes(r.name.toLowerCase())) hit.add(r.ref); });
+  const named = R.filter(r => hit.has(r.ref)).slice(0, 4);
+  for (const r of named) {
+    const a = d.assess[r.ref], hrs = d.hourlyFor && d.fetchedAt ? d.hourlyFor(r.ref) : null, pl = d.plan && d.plan.plan.find(p => p.ref === r.ref), rk = d.rank && d.rank.rows.find(x => x.ref === r.ref);
+    add('Route ' + r.ref + ' ' + r.name, HI + '; ' + FC, { class: r.cls, tier: 'P' + TIER[r.cls], km: r.km, heightM: r.elev, tonight: a || 'no forecast', hourlyTonight: hrs, dispatch: pl || null, historyByWinter: r.winters.map(w => ({ winter: w.winter, gritNights: w.grit, marginalNights: w.marginal, snowNights: w.snow, coldestC: w.minT })), priorityRule: rk ? { avgGritNights: rk.mean, suggestion: rk.moveUp ? 'move up to P2' : 'keep P' + rk.tier } : null });
+  }
+  // history
+  if (/histor|winter|past|year|last|20\d\d|record|coldest|worst|trend|average/.test(text)) {
+    const per = d.hist.winters.map((w, i) => ({ winter: w, avgGritNightsPerRoute: +(R.reduce((s, r) => s + r.winters[i].grit, 0) / R.length).toFixed(1), nights: R[0].winters[i].nights, coldestC: Math.min(...R.map(r => r.winters[i].minT)), avgSnowNights: +(R.reduce((s, r) => s + r.winters[i].snow, 0) / R.length).toFixed(1) }));
+    add('Network history by winter (1 Nov-31 Mar, nights 18:00-09:00)', HI, per);
+    const yr = (text.match(/20\d\d/) || [])[0];
+    if (yr) { const i = d.hist.winters.findIndex(w => w.startsWith(yr)); if (i >= 0) add('Routes in winter ' + d.hist.winters[i] + ' (top 10 by grit nights)', HI, R.map(r => ({ ref: r.ref, grit: r.winters[i].grit, marginal: r.winters[i].marginal, snow: r.winters[i].snow, coldestC: r.winters[i].minT })).sort((a, b) => b.grit - a.grit).slice(0, 10)); }
+  }
+  // priorities
+  if (/priorit|move up|next winter|upgrade|tier|rank|invest|which route/.test(text) && d.rank) add('Next-winter priority ranking (top 12). Rule: P3 route moves to P2 if average grit nights >= ' + d.rank.q3 + '. Tiers assumed from road class.', HI + '; ' + ASM + '; ' + RULE, d.rank.rows.slice(0, 12).map(r => ({ ref: r.ref, name: r.name, now: 'P' + r.tier, avgGrit: r.mean, range: r.min + '-' + r.max, heightM: r.elev, suggestion: r.moveUp ? 'move up to P2' : 'keep' })));
+  // trucks
+  if (/truck|depot|depart|leave|spare|fleet|dispatch|schedule|when/.test(text) && d.plan) add('Dispatch plan and fleet (fleet numbers are assumptions)', RULE + '; ' + ASM, { depots: d.depots.map(x => ({ name: x.name, trucks: x.trucks })), spare: d.plan.spare, departures: d.plan.plan.map(p => ({ ref: p.ref, depot: p.depot, depart: p.depart.slice(11), finish: p.finish.slice(11), riskStarts: p.onset.slice(11) })), notCovered: d.plan.unmet });
+  // tonight detail
+  if (d.fetchedAt && /tonight|forecast|cold|temperature|ice|frost|snow|rain|grit|marginal|freeze|today|now/.test(text) && !named.length) {
+    const rows = R.map(r => ({ ref: r.ref, ...(d.assess[r.ref] || {}) })).filter(x => x.verdict).sort((a, b) => a.minT - b.minT).slice(0, 12);
+    add('Tonight by route (12 coldest)', FC + '; ' + RULE, rows);
+  }
+  return { text: blocks.join('\n\n'), sources };
+}
 /* LOGIC END */
-if (typeof module !== 'undefined') module.exports = { CFG, TIER, hav, assessNight, planDispatch, summariseWinters, nightHours, fmtTime, rankPriorities };
+if (typeof module !== 'undefined') module.exports = { CFG, TIER, hav, assessNight, planDispatch, summariseWinters, nightHours, fmtTime, rankPriorities, buildContext };
